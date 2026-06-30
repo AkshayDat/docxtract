@@ -1,5 +1,8 @@
+import base64
+import io
 import os
 
+from PIL import Image
 from langchain_openai import ChatOpenAI
 from openai import OpenAI
 
@@ -152,6 +155,91 @@ def process_pdf(
     doc_tables = DocumentTables(
         source_file=filename,
         total_pages=total_pages,
+        tables=merged_tables,
+    )
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    json_path = export_json(doc_tables, output_dir)
+    print(f"  JSON: {json_path}")
+
+    csv_paths = export_csv(doc_tables, output_dir)
+    for p in csv_paths:
+        print(f"  CSV:  {p}")
+
+    excel_path = export_excel(doc_tables, output_dir)
+    print(f"  XLSX: {excel_path}")
+
+    print(f"\nDone: {filename} → {len(merged_tables)} table(s) exported.")
+    return doc_tables
+
+
+def process_image(
+    image_path: str,
+    output_dir: str,
+    model: str = "gpt-4o",
+    validate: bool = True,
+    max_retries: int = 2,
+) -> DocumentTables:
+    """Process an image file (PNG/JPG/etc) — send directly to GPT-4o vision."""
+    filename = os.path.basename(image_path)
+    print(f"\n{'='*60}")
+    print(f"Processing image: {filename}")
+    print(f"{'='*60}")
+
+    llm = ChatOpenAI(model=model, temperature=0, max_tokens=4096)
+
+    # Load image and convert to base64
+    print("\n[1/4] Loading image...")
+    img = Image.open(image_path)
+    if img.mode == "RGBA":
+        img = img.convert("RGB")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    print(f"  Image size: {img.width}x{img.height}")
+
+    # Extract tables via vision
+    print("\n[2/4] Extracting tables via GPT-4o vision...")
+    extracted = extract_table_from_image(llm, img_b64, page_num=1, table_id="table_1")
+
+    raw_tables = []
+    if extracted and extracted.columns:
+        raw_tables.append(extracted)
+        print(f"  Found table: {len(extracted.columns)} columns, {len(extracted.rows)} rows")
+    else:
+        print("  No tables found in image.")
+
+    merged_tables = raw_tables
+
+    # Validate
+    if validate and merged_tables:
+        print("\n[3/4] Validating extracted tables...")
+        validated_tables = []
+        for table in merged_tables:
+            for attempt in range(max_retries + 1):
+                cleaned, report = validate_table(llm, table)
+                conf = report["confidence"]
+                if report["is_valid"]:
+                    print(f"  {table.table_id}: VALID (confidence: {conf:.0%})")
+                    validated_tables.append(cleaned)
+                    break
+                elif attempt < max_retries:
+                    print(f"  {table.table_id}: Issues found, retrying ({attempt + 1}/{max_retries})...")
+                    table = cleaned
+                else:
+                    print(f"  {table.table_id}: Accepting with issues (confidence: {conf:.0%})")
+                    validated_tables.append(cleaned)
+        merged_tables = validated_tables
+    else:
+        print("\n[3/4] Skipping validation.")
+
+    # Export
+    print("\n[4/4] Exporting results...")
+    stem = os.path.splitext(filename)[0]
+    doc_tables = DocumentTables(
+        source_file=filename,
+        total_pages=1,
         tables=merged_tables,
     )
 
